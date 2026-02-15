@@ -4,3 +4,4 @@ models/
 *.csv
 *.pkl
 __pycache__/
+*.docx
