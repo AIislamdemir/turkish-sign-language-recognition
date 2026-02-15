@@ -1,0 +1,6 @@
+venv/
+dataset/
+models/
+*.csv
+*.pkl
+__pycache__/
