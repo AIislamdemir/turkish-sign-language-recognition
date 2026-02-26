@@ -2,7 +2,42 @@ import os
 import csv
 import cv2
 import mediapipe as mp
+import numpy as np
 
+class HandLandmarkExtractor:
+    def __init__(self):
+        self.hands = mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=1,
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.7
+        )
+
+    def extract(self, frame):
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        result = self.hands.process(frame_rgb)
+
+        if not result.multi_hand_landmarks:
+            return None
+
+        hand_landmarks = result.multi_hand_landmarks[0]
+
+        coords = []
+        for lm in hand_landmarks.landmark:
+            coords.append([lm.x, lm.y, lm.z])
+
+        coords = np.array(coords)
+
+        # Wrist referanslı normalize
+        wrist = coords[0]
+        coords = coords - wrist
+
+        # Scale normalize
+        max_value = np.max(np.abs(coords))
+        if max_value > 0:
+            coords = coords / max_value
+
+        return coords.flatten()
 BASE_DIR = "dataset"
 CSV_PATH = "landmarks.csv"
 
