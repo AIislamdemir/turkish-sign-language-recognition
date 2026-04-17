@@ -23,6 +23,7 @@ Proje kök dizininde çalıştırın (handswith_ai_connect/ içinde).
 import os
 import csv
 import cv2
+import numpy as np
 import mediapipe as mp
 
 BASE_DIR  = "dataset"
@@ -36,11 +37,22 @@ _ZEROS    = [0.0] * _SINGLE   # eksik el yerine kullanılacak dolgu
 
 
 def _hand_to_list(hand_landmarks):
-    """Bir elin landmark'larını 63 floatlık listeye dönüştür."""
-    row = []
-    for lm in hand_landmarks.landmark:
-        row.extend([lm.x, lm.y, lm.z])
-    return row
+    """Bir elin landmark'larını normalize edilmiş 63 floatlık listeye dönüştür.
+
+    Normalizasyon:
+      1. Wrist (bilek, nokta 0) referans alınarak tüm koordinatlar kaydırılır.
+      2. Maksimum mutlak değere bölünerek ölçek normalize edilir.
+    Bu sayede model farklı el boyutlarına ve kamera mesafelerine dayanıklı olur.
+    """
+    coords = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark],
+                      dtype=np.float32)
+    # 1. Wrist referanslı kaydırma
+    coords -= coords[0]
+    # 2. Scale normalizasyon
+    max_val = np.max(np.abs(coords))
+    if max_val > 0:
+        coords /= max_val
+    return coords.flatten().tolist()
 
 
 def process_image(image_path, class_label, hands):

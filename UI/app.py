@@ -35,11 +35,14 @@ import cv2
 import numpy as np
 import mediapipe as mp
 from flask import Flask, Response, render_template_string, jsonify, request
+from tensorflow.keras.models import load_model
 
 # ── Paths ──────────────────────────────────────────────────────────
-BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR   = os.path.dirname(BASE_DIR)
-MODEL_PATH = os.path.join(ROOT_DIR, "letter_model_rf.pkl")
+BASE_DIR         = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR         = os.path.dirname(BASE_DIR)
+MODEL_PATH       = os.path.join(ROOT_DIR, "letter_model_rf.pkl")
+LSTM_MODEL_PATH  = os.path.join(ROOT_DIR, "word_model_lstm.h5")
+LSTM_LABELS_PATH = os.path.join(ROOT_DIR, "word_label_classes.npy")
 
 # ── Config ──────────────────────────────────────────────────────────
 HOLD_DURATION        = 0.9
@@ -60,18 +63,29 @@ COLOUR_RIGHT = (40,  170, 255)   # BGR amber-orange
 DOT_COLOUR   = (255, 255, 255)
 
 # ── Model ────────────────────────────────────────────────────────────
-print("[1/3] Model yükleniyor...")
+print("[1/3] Modeller yükleniyor...")
 with open(MODEL_PATH, 'rb') as f:
     data = pickle.load(f)
 rf_model = data["model"]
 classes  = list(data["classes"])
 
-# Detect whether the model expects 63 (single-hand) or 126 (dual-hand)
-# features so we can zero-pad correctly in both cases.
 n_features = rf_model.n_features_in_
-print(f"    OK — {len(classes)} sınıf: {classes}")
-print(f"    Model giriş boyutu: {n_features} özellik "
-      f"({'çift el' if n_features >= 126 else 'tek el — sıfır dolgu aktif'})")
+print(f"    RF OK — {len(classes)} sınıf")
+
+# ── LSTM Kelime Modeli ────────────────────────────────────────────
+try:
+    lstm_model        = load_model(LSTM_MODEL_PATH)
+    word_classes      = list(np.load(LSTM_LABELS_PATH, allow_pickle=True))
+    LSTM_AVAILABLE    = True
+    print(f"    LSTM OK — {len(word_classes)} kelime: {word_classes}")
+except Exception as e:
+    lstm_model     = None
+    word_classes   = []
+    LSTM_AVAILABLE = False
+    print(f"    LSTM yüklenemedi (kelime tanıma devre dışı): {e}")
+
+FRAMES_PER_SEQ    = 30   # LSTM sekans uzunluğu
+WORD_CONF_THRESH  = 0.80  # Kelime güven eşiği
 
 # ── MediaPipe ────────────────────────────────────────────────────────
 print("[2/3] MediaPipe başlatılıyor...")
@@ -98,6 +112,8 @@ state = {
     "sentence":     "",
     "history":      [],
     "auto_enabled": True,
+    "word_detected": "",
+    "word_confidence": 0.0,
 }
 state_lock  = threading.Lock()
 latest_jpeg = None
@@ -124,11 +140,21 @@ _SINGLE_LEN = 63   # 21 landmarks × 3
 _DUAL_LEN   = 126  # 42 landmarks × 3
 
 def _landmarks_to_array(hand_landmarks):
-    """Flatten a single hand's landmarks to a 63-float numpy array."""
-    return np.array(
-        [v for lm in hand_landmarks.landmark for v in (lm.x, lm.y, lm.z)],
+    """Flatten a single hand's landmarks to a normalized 63-float numpy array.
+
+    Normalization (must match extract_landmarks_fixed.py):
+      1. Subtract wrist (landmark 0) → translation invariant.
+      2. Divide by max absolute value → scale invariant.
+    """
+    coords = np.array(
+        [[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark],
         dtype=np.float32
     )
+    coords -= coords[0]                     # wrist-relative
+    max_val = np.max(np.abs(coords))
+    if max_val > 0:
+        coords /= max_val                   # scale normalize
+    return coords.flatten()
 
 def build_feature_vector(left_lm, right_lm):
     """
@@ -202,6 +228,10 @@ def inference_thread():
     stable_start  = None
     letter_added  = False
     no_hand_start = None
+    # LSTM kelime sekansı
+    word_seq      = deque(maxlen=FRAMES_PER_SEQ)
+    word_det      = ""
+    word_conf_val = 0.0
 
     while True:
         try:
@@ -288,6 +318,25 @@ def inference_thread():
             if len(pred_buffer) > 5:
                 detected_letter = Counter(pred_buffer).most_common(1)[0][0]
 
+            # ── LSTM Kelime Tanıma ───────────────────────────────────────
+            feat_vec = build_feature_vector(left_lm, right_lm).flatten()
+            word_seq.append(feat_vec)
+
+            if LSTM_AVAILABLE and len(word_seq) == FRAMES_PER_SEQ:
+                seq_arr  = np.array(list(word_seq), dtype=np.float32).reshape(1, FRAMES_PER_SEQ, -1)
+                w_proba  = lstm_model.predict(seq_arr, verbose=0)[0]
+                w_cid    = int(np.argmax(w_proba))
+                w_conf   = float(w_proba[w_cid])
+                if w_conf > WORD_CONF_THRESH:
+                    word_det      = word_classes[w_cid]
+                    word_conf_val = w_conf
+                else:
+                    word_det      = ""
+                    word_conf_val = 0.0
+            else:
+                word_det      = word_det if LSTM_AVAILABLE else ""
+                word_conf_val = word_conf_val if LSTM_AVAILABLE else 0.0
+
             # ── Auto-hold timer ──────────────────────────────────────────
             with state_lock:
                 auto_on = state["auto_enabled"]
@@ -322,6 +371,9 @@ def inference_thread():
             letter_added  = False
             hold_progress = 0.0
             pred_buffer.clear()
+            word_seq.clear()
+            word_det      = ""
+            word_conf_val = 0.0
 
             # Auto-space after timeout (deadlock-safe: read flag+word inside
             # lock, then release before calling do_space)
@@ -348,6 +400,8 @@ def inference_thread():
             state["left_detected"]  = left_found
             state["right_detected"] = right_found
             state["hold_progress"]  = round(hold_progress * 100, 1)
+            state["word_detected"]  = word_det
+            state["word_confidence"]= round(word_conf_val * 100, 1)
 
         _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
         with jpeg_lock:
@@ -386,6 +440,14 @@ def api_add():
     letter = (request.get_json() or {}).get('letter', '')
     if letter:
         do_add_letter(letter)
+    return jsonify(ok=True)
+
+@app.route('/word/add_word', methods=['POST'])
+def api_add_word():
+    word = (request.get_json() or {}).get('word', '').strip()
+    if word:
+        with state_lock:
+            state["word"] += word + " "
     return jsonify(ok=True)
 
 @app.route('/word/space',     methods=['POST'])
@@ -629,6 +691,21 @@ footer{margin-top:28px;padding-top:18px;border-top:1px solid var(--border);
 .ft{font-family:'Space Mono',monospace;font-size:.63rem;color:var(--muted)}
 .ft-tag{font-family:'Space Mono',monospace;font-size:.63rem;color:var(--muted);
   background:var(--s2);border:1px solid var(--border);padding:3px 9px;border-radius:4px}
+/* ── Word detection card ── */
+.word-det-card{background:var(--s);border:1px solid var(--border);border-radius:14px;
+  padding:18px;text-align:center;position:relative;overflow:hidden}
+.word-det-card::before{content:'';position:absolute;inset:0;
+  background:radial-gradient(ellipse at 50% 0%,rgba(255,170,42,.05) 0%,transparent 70%);
+  pointer-events:none}
+.word-big{font-size:1.8rem;font-weight:800;letter-spacing:2px;
+  background:linear-gradient(135deg,var(--right),#ffdd80);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+  min-height:48px;display:flex;align-items:center;justify-content:center;
+  transition:all .2s}
+.word-big.dim{opacity:.2;filter:none}
+.word-conf-bar{height:4px;background:var(--border);border-radius:2px;overflow:hidden;margin-top:8px}
+.word-conf-fill{height:100%;border-radius:2px;
+  background:linear-gradient(90deg,#ffaa2a,#ffdd80);transition:width .3s;width:0}
 
 @media(max-width:900px){.grid{grid-template-columns:1fr}}
 </style>
@@ -731,6 +808,20 @@ footer{margin-top:28px;padding-top:18px;border-top:1px solid var(--border);
         </div>
       </div>
 
+      <!-- ★ Kelime Tanıma Kartı -->
+      <div class="word-det-card">
+        <div class="lbl" style="margin-bottom:10px;">Tanınan Kelime</div>
+        <div class="word-big dim" id="wdbig">—</div>
+        <div class="word-conf-bar">
+          <div class="word-conf-fill" id="wcbar"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-top:6px;">
+          <span style="font-family:Space Mono,monospace;font-size:.6rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px;">Kelime Güveni</span>
+          <span style="font-family:Space Mono,monospace;font-size:.65rem;color:var(--right);font-weight:700;" id="wcval">0%</span>
+        </div>
+        <button class="btn" style="margin-top:10px;width:100%;" onclick="addWord()">+ Cümleye Ekle (W)</button>
+      </div>
+
       <div class="word-card">
         <div class="word-hdr">
           <span class="sec-title">Mevcut Kelime</span>
@@ -755,6 +846,7 @@ footer{margin-top:28px;padding-top:18px;border-top:1px solid var(--border);
 
       <div class="shortcuts">
         <div class="sc"><kbd>E</kbd>Harf ekle</div>
+        <div class="sc"><kbd>W</kbd>Kelime ekle</div>
         <div class="sc"><kbd>Space</kbd>Boşluk/Kaydet</div>
         <div class="sc"><kbd>⌫</kbd>Geri al</div>
         <div class="sc"><kbd>Esc</kbd>Temizle</div>
@@ -840,6 +932,19 @@ async function poll(){
     if(d.sentence !== lastSent){ lastSent = d.sentence; renderSent(d.sentence); }
     renderHist(d.history);
 
+    // ★ Kelime tanıma güncelle
+    const wb = document.getElementById('wdbig');
+    if(d.word_detected){
+      wb.textContent = d.word_detected.replace(/_/g,' ').toUpperCase();
+      wb.classList.remove('dim');
+    } else {
+      wb.textContent = '—';
+      wb.classList.add('dim');
+    }
+    document.getElementById('wcval').textContent = d.word_confidence + '%';
+    document.getElementById('wcbar').style.width  = d.word_confidence + '%';
+    window._curWord = d.word_detected || "";
+
   }catch(e){}
   setTimeout(poll, 80);
 }
@@ -888,8 +993,15 @@ async function toggleAuto(){
   });
 }
 
+async function addWord(){
+  const w = (window._curWord || "").replace(/_/g," ");
+  if(!w) return;
+  await fetch('/word/add_word',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({word:w})});
+}
+
 document.addEventListener('keydown', e => {
   if     (e.key==='e'||e.key==='E')  addL();
+  else if(e.key==='w'||e.key==='W')  addWord();
   else if(e.key===' ')               { e.preventDefault(); addSp(); }
   else if(e.key==='Backspace')       bksp();
   else if(e.key==='Escape')          clearW();
