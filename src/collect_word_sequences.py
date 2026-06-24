@@ -31,9 +31,9 @@ WORDS = [
     "evet", "gel", "gitt", "güle güle", "hayır",
     "iyiyim", "iş", "ozur dilerim", "kötü", "lütfen",
     "merhaba", "nasılsın", "ne", "ne zaman", "nerde",
-    "o", "okul", "onlar", "para", "senin",
+    "o", "okul", "onlar", "para", "senin", "gunaydin",
     "siz", "tamam", "telefon", "teşekürler", "memnun oldum",
-    "görüşürüz","rica ederim","benim","adım",
+    "görüşürüz","rica ederim","benim","adım","seviyorum"
 ]
 
 # ─────────────────────────────────────────────────────────────
