@@ -217,6 +217,9 @@ def capture_thread():
                 pass
         frame_queue.put(frame)
 
+
+
+
 # ══════════════════════════════════════════════════════════════════════
 # THREAD-2: Inference (MediaPipe + RF)  ★ DUAL-HAND REWRITE
 # ══════════════════════════════════════════════════════════════════════
